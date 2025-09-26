@@ -269,24 +269,31 @@ def fetch_pending_lines(pos_categ_id=None, limit_orders=20):
     return out
 
 def fetch_recent_printed(pos_categ_id=None, limit_orders=20):
-    """Obtiene los últimos pedidos impresos (x_impreso_cocina=True)."""
+    """Obtiene los pedidos del día (impresos o pendientes) ordenados por hora descendente."""
+    today_start = dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_str = today_start.strftime('%Y-%m-%d %H:%M:%S')
+
     domain_lines = [
-        ('x_impreso_cocina', '=', True),
         ('qty', '>', 0),
-        ('order_id.state', 'in', ['paid', 'done']),
+        ('order_id.state', 'in', ['paid', 'done', 'invoiced']),
+        ('order_id.date_order', '>=', today_start_str),
     ]
     if pos_categ_id:
         domain_lines.append(('product_id.pos_categ_id', 'child_of', pos_categ_id))
 
+    # Traemos suficientes líneas para cubrir el límite deseado de pedidos.
     line_ids = models.execute_kw(
         ODOO_DB, uid, ODOO_PWD,
         'pos.order.line', 'search',
-        [domain_lines], {'limit': limit_orders * 5, 'order': 'write_date desc'}
+        [domain_lines], {'limit': max(50, limit_orders * 10), 'order': 'order_id.date_order desc, id desc'}
     )
     if not line_ids:
         return []
 
-    fields_line = ['id', 'order_id', 'product_id', 'display_name', 'qty', 'note', 'x_impreso_cocina', 'write_date']
+    fields_line = [
+        'id', 'order_id', 'product_id', 'display_name', 'qty', 'note',
+        'x_impreso_cocina', 'write_date'
+    ]
     lines = models.execute_kw(
         ODOO_DB, uid, ODOO_PWD,
         'pos.order.line', 'read',
@@ -294,18 +301,11 @@ def fetch_recent_printed(pos_categ_id=None, limit_orders=20):
     )
 
     orders_map = {}
-    order_dates = {}
-    order_sequence = []
-    for l in lines:
-        oid = l['order_id'][0]
-        orders_map.setdefault(oid, []).append(l)
-        write_date = l.get('write_date') or ''
-        if oid not in order_dates or write_date > order_dates[oid]:
-            order_dates[oid] = write_date
-        if oid not in order_sequence:
-            order_sequence.append(oid)
+    for line in lines:
+        oid = line['order_id'][0]
+        orders_map.setdefault(oid, []).append(line)
 
-    order_ids = order_sequence[:limit_orders]
+    order_ids = list(orders_map.keys())
     if not order_ids:
         return []
 
@@ -315,18 +315,35 @@ def fetch_recent_printed(pos_categ_id=None, limit_orders=20):
         'pos.order', 'read', [order_ids], {'fields': fields_order}
     )
 
-    out = []
-    for o in orders:
-        lines = orders_map.get(o['id'], [])
-        out.append({
-            'order': o,
+    orders_by_id = {order['id']: order for order in orders}
+    payloads = []
+    for oid, lines in orders_map.items():
+        order = orders_by_id.get(oid)
+        if not order:
+            continue
+        last_write = ''
+        all_printed = True
+        for line in lines:
+            write_date = line.get('write_date') or ''
+            if write_date > last_write:
+                last_write = write_date
+            if not line.get('x_impreso_cocina'):
+                all_printed = False
+        date_order = order.get('date_order') or ''
+        last_activity = max(last_write, date_order)
+        payloads.append({
+            'order': order,
             'lines': lines,
-            'last_write_date': order_dates.get(o['id']),
-            'ticket_text': build_ticket(o, lines),
+            'ticket_text': build_ticket(order, lines),
+            'printed': all_printed,
+            'last_write_date': last_write,
+            'last_activity': last_activity,
         })
 
-    out.sort(key=lambda item: item.get('last_write_date') or '', reverse=True)
-    return out
+    payloads.sort(key=lambda item: item.get('last_activity') or '', reverse=True)
+    if limit_orders:
+        payloads = payloads[:limit_orders]
+    return payloads
 
 def mark_printed(line_ids, error_msg=None):
     vals = {'x_impreso_cocina': True}
@@ -442,16 +459,18 @@ if args.gui:
             list_frame = ttk.Frame(main)
             list_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
-            columns = ("ticket", "mesa", "cliente", "fecha")
+            columns = ("ticket", "mesa", "cliente", "fecha", "estado")
             self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=10)
             self.tree.heading("ticket", text="Ticket")
             self.tree.heading("mesa", text="Mesa")
             self.tree.heading("cliente", text="Cliente")
-            self.tree.heading("fecha", text="Última impresión")
+            self.tree.heading("fecha", text="Hora")
+            self.tree.heading("estado", text="Estado")
             self.tree.column("ticket", width=140)
             self.tree.column("mesa", width=120)
             self.tree.column("cliente", width=180)
             self.tree.column("fecha", width=160)
+            self.tree.column("estado", width=110, anchor=tk.CENTER)
             self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
 
             tree_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
@@ -509,7 +528,7 @@ if args.gui:
                 except Exception as exc:
                     self.after(0, lambda: messagebox.showerror("Error al refrescar", str(exc)))
                     self.after(0, lambda: self.set_status("Error al refrescar"))
-            self.set_status("Actualizando comandas impresas...")
+            self.set_status("Actualizando comandas...")
             self._run_async(job)
 
         def _load_printed_orders(self, orders):
@@ -521,9 +540,10 @@ if args.gui:
                 partner = (order.get('partner_id') or ['', ''])
                 mesa = table[1] if len(table) > 1 else ''
                 cliente = partner[1] if len(partner) > 1 else ''
-                fecha = payload.get('last_write_date') or ''
-                self.tree.insert('', tk.END, iid=str(idx), values=(order.get('name'), mesa, cliente, fecha))
-            self.set_status(f"Comandas impresas: {len(orders)}")
+                fecha = payload.get('last_activity') or order.get('date_order') or ''
+                estado = "Impresa" if payload.get('printed') else "Pendiente"
+                self.tree.insert('', tk.END, iid=str(idx), values=(order.get('name'), mesa, cliente, fecha, estado))
+            self.set_status(f"Comandas del día: {len(orders)}")
             if orders:
                 self.tree.selection_set('0')
 
@@ -580,6 +600,9 @@ if args.gui:
                 return
             idx = int(selection[0])
             payload = self.printed_orders[idx]
+            if not payload.get('printed'):
+                messagebox.showinfo("Reimprimir", "Solo se pueden reimprimir comandas ya impresas.")
+                return
             txt = payload.get('ticket_text')
             def job():
                 try:
