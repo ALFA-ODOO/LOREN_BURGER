@@ -22,9 +22,47 @@ import os
 import sys
 import argparse
 import datetime as dt
+import json
 import textwrap
 import xmlrpc.client
+from pathlib import Path
 from dotenv import load_dotenv
+
+# =========================
+# Configuración persistente
+# =========================
+CONFIG_PATH = Path(__file__).with_name("imprimir_cocina_config.json")
+
+
+def load_config():
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return {}
+
+
+def save_config(config):
+    try:
+        with CONFIG_PATH.open("w", encoding="utf-8") as fh:
+            json.dump(config, fh, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        print(f"Advertencia: no se pudo guardar la configuración: {exc}")
+
+
+CONFIG = load_config()
+
+
+def _argument_provided(flag):
+    prefix = f"{flag}="
+    for arg in sys.argv[1:]:
+        if arg == flag or arg.startswith(prefix):
+            return True
+    return False
+
 
 # =========================
 # CLI
@@ -38,6 +76,18 @@ ap.add_argument("--printer", type=str, default=None, help="Nombre de impresora W
 ap.add_argument("--gui", action="store_true", help="Abre la interfaz gráfica de monitoreo/impr. de comandas")
 ap.add_argument("--auto-interval", type=int, default=30, help="Segundos entre ejecuciones automáticas (GUI)")
 args = ap.parse_args()
+
+if not _argument_provided("--auto-interval"):
+    cfg_interval = CONFIG.get("auto_interval")
+    if isinstance(cfg_interval, int) and cfg_interval > 0:
+        args.auto_interval = cfg_interval
+
+if not _argument_provided("--printer") and not args.printer:
+    cfg_printer = CONFIG.get("printer")
+    if isinstance(cfg_printer, str) and cfg_printer.strip():
+        args.printer = cfg_printer.strip()
+
+SELECTED_PRINTER = args.printer or None
 
 # =========================
 # ENV
@@ -183,7 +233,35 @@ def get_default_printer():
     except Exception:
         return None
 
+
+def list_available_printers():
+    try:
+        import win32print
+    except ImportError:
+        return []
+
+    flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+    try:
+        printers = win32print.EnumPrinters(flags)
+    except Exception:
+        printers = []
+
+    names = []
+    for entry in printers:
+        if len(entry) >= 3:
+            name = entry[2]
+            if name and name not in names:
+                names.append(name)
+
+    default = get_default_printer()
+    if default:
+        names = [default] + [n for n in names if n != default]
+    return names
+
+
 def resolve_printer():
+    if SELECTED_PRINTER:
+        return SELECTED_PRINTER
     if args.printer:
         return args.printer
     p = get_default_printer()
@@ -422,12 +500,27 @@ if args.gui:
             self.title("Comandas Cocina")
             self.geometry("900x600")
 
-            self.interval_var = tk.IntVar(value=max(5, args.auto_interval))
+            initial_interval = max(5, int(args.auto_interval or 5))
+            self.interval_var = tk.IntVar(value=initial_interval)
+            self.interval_var.trace_add("write", lambda *_: self.persist_settings())
+
+            self.printer_list = list_available_printers()
+            self.printer_var = tk.StringVar()
+            initial_printer = args.printer or (self.printer_list[0] if self.printer_list else "")
+            if initial_printer and initial_printer not in self.printer_list:
+                self.printer_list.append(initial_printer)
+            if not initial_printer and self.printer_list:
+                initial_printer = self.printer_list[0]
+            self.printer_var.set(initial_printer)
+            self._update_selected_printer(initial_printer)
+
             self.auto_thread = None
             self.auto_stop = threading.Event()
             self.printed_orders = []
 
             self._build_layout()
+            self.protocol("WM_DELETE_WINDOW", self.on_close)
+            self.persist_settings()
             self.refresh_printed_orders()
 
         # ----- UI construction -----
@@ -448,6 +541,18 @@ if args.gui:
                 width=5
             )
             interval_spin.pack(side=tk.LEFT, padx=(5, 15))
+
+            ttk.Label(controls, text="Impresora:").pack(side=tk.LEFT)
+            combo_state = "readonly" if self.printer_list else "normal"
+            self.printer_combo = ttk.Combobox(
+                controls,
+                values=self.printer_list,
+                textvariable=self.printer_var,
+                state=combo_state,
+                width=40,
+            )
+            self.printer_combo.pack(side=tk.LEFT, padx=(5, 15))
+            self.printer_combo.bind("<<ComboboxSelected>>", self.on_printer_selected)
 
             ttk.Button(controls, text="Imprimir pendientes", command=self.print_pending_orders).pack(side=tk.LEFT)
             ttk.Button(controls, text="Reimprimir selección", command=self.reprint_selected).pack(side=tk.LEFT, padx=5)
@@ -497,6 +602,16 @@ if args.gui:
             ttk.Label(main, textvariable=self.status_var).pack(fill=tk.X)
 
         # ----- Helpers -----
+        def _update_selected_printer(self, name):
+            global SELECTED_PRINTER
+            cleaned = (name or "").strip()
+            SELECTED_PRINTER = cleaned or None
+            args.printer = SELECTED_PRINTER
+
+        def on_printer_selected(self, event=None):
+            self._update_selected_printer(self.printer_var.get())
+            self.persist_settings()
+
         def append_log(self, msg):
             ts = dt.datetime.now().strftime("%H:%M:%S")
             self.log_text.configure(state=tk.NORMAL)
@@ -506,6 +621,16 @@ if args.gui:
 
         def set_status(self, msg):
             self.status_var.set(msg)
+
+        def persist_settings(self):
+            global CONFIG
+            CONFIG['auto_interval'] = self._safe_interval()
+            printer_name = (self.printer_var.get() or "").strip()
+            if printer_name:
+                CONFIG['printer'] = printer_name
+            else:
+                CONFIG.pop('printer', None)
+            save_config(CONFIG)
 
         def _safe_interval(self):
             try:
@@ -670,11 +795,15 @@ if args.gui:
             self.append_log("Auto impresión iniciada.")
 
         def destroy(self):
+            self.persist_settings()
             if self.auto_thread and self.auto_thread.is_alive():
                 self.auto_stop.set()
                 self.auto_thread.join(timeout=2)
             self.auto_thread = None
             super().destroy()
+
+        def on_close(self):
+            self.destroy()
 
 # =========================
 # Main
