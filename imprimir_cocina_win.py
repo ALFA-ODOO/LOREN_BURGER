@@ -285,7 +285,7 @@ def fetch_recent_printed(pos_categ_id=None, limit_orders=20):
     line_ids = models.execute_kw(
         ODOO_DB, uid, ODOO_PWD,
         'pos.order.line', 'search',
-        [domain_lines], {'limit': max(50, limit_orders * 10), 'order': 'order_id.date_order desc, id desc'}
+        [domain_lines], {'limit': max(50, limit_orders * 10), 'order': 'write_date desc, id desc'}
     )
     if not line_ids:
         return []
