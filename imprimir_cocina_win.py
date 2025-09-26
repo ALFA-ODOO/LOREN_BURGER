@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 imprimir_cocina_win.py
-Toma líneas de TPV pagadas y no impresas (x_impreso_cocina=False) y las imprime
-en la impresora (por defecto, la predeterminada de Windows). Luego marca como impresas.
+Toma líneas de TPV cobradas (paid/done/invoiced) y no impresas (x_impreso_cocina=False)
+y las imprime en la impresora (por defecto, la predeterminada de Windows). Luego marca como impresas.
 
 Uso:
   - Prueba de impresión (sin Odoo):        python imprimir_cocina_win.py --print-test
@@ -217,16 +217,19 @@ def print_test_page(msg="PRUEBA COCINA – EPSON TM-T20III"):
 # =========================
 # Odoo: fetch y marcado
 # =========================
+PENDING_ORDER_STATES = ['paid', 'done', 'invoiced']
+
+
 def fetch_pending_lines(pos_categ_id=None, limit_orders=20):
     """
     Devuelve dict {order_id: {'order': order_read, 'lines': [line_read,...]}}
-    Filtros: pedido state='paid', x_impreso_cocina=False, qty>0.
+    Filtros: pedido state in PENDING_ORDER_STATES, x_impreso_cocina=False, qty>0.
     """
 
     domain_lines = [
         ('x_impreso_cocina', '=', False),
         ('qty', '>', 0),
-        ('order_id.state', '=', 'paid'),
+        ('order_id.state', 'in', PENDING_ORDER_STATES),
     ]
     if pos_categ_id:
         domain_lines.append(('product_id.pos_categ_id', 'child_of', pos_categ_id))
