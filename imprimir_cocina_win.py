@@ -10,6 +10,7 @@ Uso:
   - Ejecutar real:                         python imprimir_cocina_win.py
   - Filtrar por categoría TPV (ID):        python imprimir_cocina_win.py --pos-categ 12
   - Elegir impresora (no la predeterminada): python imprimir_cocina_win.py --printer "EPSON TM-T20III Receipt"
+  - Abrir interfaz gráfica:                python imprimir_cocina_win.py --gui
 
 Requisitos:
   - pywin32
@@ -34,6 +35,8 @@ ap.add_argument("--pos-categ", type=int, default=None, help="ID de Categoría de
 ap.add_argument("--max-orders", type=int, default=20, help="Máx. pedidos a procesar por corrida")
 ap.add_argument("--print-test", action="store_true", help="Imprime una página de prueba en la impresora seleccionada y sale")
 ap.add_argument("--printer", type=str, default=None, help="Nombre de impresora Windows (si no se indica, usa la predeterminada)")
+ap.add_argument("--gui", action="store_true", help="Abre la interfaz gráfica de monitoreo/impr. de comandas")
+ap.add_argument("--auto-interval", type=int, default=30, help="Segundos entre ejecuciones automáticas (GUI)")
 args = ap.parse_args()
 
 # =========================
@@ -44,6 +47,10 @@ ODOO_URL = os.getenv("ODOO_URL")
 ODOO_DB = os.getenv("ODOO_DB")
 ODOO_USER = os.getenv("ODOO_USERNAME")
 ODOO_PWD = os.getenv("ODOO_PASSWORD")
+
+if args.gui and args.print_test:
+    print("La interfaz gráfica no está disponible con --print-test.")
+    sys.exit(1)
 
 if not all([ODOO_URL, ODOO_DB, ODOO_USER, ODOO_PWD]) and not args.print_test:
     print("Faltan variables en .env (ODOO_URL/DB/USERNAME/PASSWORD).")
@@ -215,7 +222,7 @@ def fetch_pending_lines(pos_categ_id=None, limit_orders=20):
     Devuelve dict {order_id: {'order': order_read, 'lines': [line_read,...]}}
     Filtros: pedido state='paid', x_impreso_cocina=False, qty>0.
     """
-    
+
     domain_lines = [
         ('x_impreso_cocina', '=', False),
         ('qty', '>', 0),
@@ -258,6 +265,66 @@ def fetch_pending_lines(pos_categ_id=None, limit_orders=20):
         out[o['id']] = {'order': o, 'lines': orders_map.get(o['id'], [])}
     return out
 
+def fetch_recent_printed(pos_categ_id=None, limit_orders=20):
+    """Obtiene los últimos pedidos impresos (x_impreso_cocina=True)."""
+    domain_lines = [
+        ('x_impreso_cocina', '=', True),
+        ('qty', '>', 0),
+        ('order_id.state', 'in', ['paid', 'done']),
+    ]
+    if pos_categ_id:
+        domain_lines.append(('product_id.pos_categ_id', 'child_of', pos_categ_id))
+
+    line_ids = models.execute_kw(
+        ODOO_DB, uid, ODOO_PWD,
+        'pos.order.line', 'search',
+        [domain_lines], {'limit': limit_orders * 5, 'order': 'write_date desc'}
+    )
+    if not line_ids:
+        return []
+
+    fields_line = ['id', 'order_id', 'product_id', 'display_name', 'qty', 'note', 'x_impreso_cocina', 'write_date']
+    lines = models.execute_kw(
+        ODOO_DB, uid, ODOO_PWD,
+        'pos.order.line', 'read',
+        [line_ids], {'fields': fields_line}
+    )
+
+    orders_map = {}
+    order_dates = {}
+    order_sequence = []
+    for l in lines:
+        oid = l['order_id'][0]
+        orders_map.setdefault(oid, []).append(l)
+        write_date = l.get('write_date') or ''
+        if oid not in order_dates or write_date > order_dates[oid]:
+            order_dates[oid] = write_date
+        if oid not in order_sequence:
+            order_sequence.append(oid)
+
+    order_ids = order_sequence[:limit_orders]
+    if not order_ids:
+        return []
+
+    fields_order = ['id', 'name', 'partner_id', 'table_id', 'date_order', 'amount_total', 'state']
+    orders = models.execute_kw(
+        ODOO_DB, uid, ODOO_PWD,
+        'pos.order', 'read', [order_ids], {'fields': fields_order}
+    )
+
+    out = []
+    for o in orders:
+        lines = orders_map.get(o['id'], [])
+        out.append({
+            'order': o,
+            'lines': lines,
+            'last_write_date': order_dates.get(o['id']),
+            'ticket_text': build_ticket(o, lines),
+        })
+
+    out.sort(key=lambda item: item.get('last_write_date') or '', reverse=True)
+    return out
+
 def mark_printed(line_ids, error_msg=None):
     vals = {'x_impreso_cocina': True}
     try:
@@ -271,6 +338,311 @@ def mark_printed(line_ids, error_msg=None):
         [line_ids, vals]
     )
 
+def process_pending_orders(pos_categ_id=None, max_orders=20, dry_run=False, verbose=True):
+    batches = fetch_pending_lines(pos_categ_id=pos_categ_id, limit_orders=max_orders)
+    if not batches:
+        if verbose:
+            print("No hay líneas pendientes para imprimir.")
+        return {'printed': [], 'errors': []}
+
+    printed_payloads = []
+    errors = []
+    for oid, payload in batches.items():
+        order = payload['order']
+        lines = payload['lines']
+        txt = build_ticket(order, lines)
+
+        if verbose:
+            print(f"\n=== Pedido {order.get('name')} (ID {oid}) ===")
+            print(txt)
+
+        if dry_run:
+            if verbose:
+                print("DRY-RUN: no se imprime ni se marca.")
+        else:
+            try:
+                print_raw_selected(txt, verbose=verbose)
+                mark_printed([l['id'] for l in lines])
+                if verbose:
+                    print("OK: Impreso y marcado.")
+            except Exception as exc:
+                if verbose:
+                    print(f"ERROR al imprimir pedido {order.get('name')}: {exc}")
+                errors.append({
+                    'order': order,
+                    'lines': lines,
+                    'ticket_text': txt,
+                    'error': exc,
+                })
+                continue
+
+        printed_payloads.append({
+            'order': order,
+            'lines': lines,
+            'ticket_text': txt,
+        })
+
+    return {'printed': printed_payloads, 'errors': errors}
+
+# =========================
+# GUI
+# =========================
+if args.gui:
+    try:
+        import threading
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+    except Exception as gui_err:
+        print(f"No se pudo iniciar la interfaz gráfica: {gui_err}")
+        sys.exit(1)
+
+    class KitchenPrinterGUI(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("Comandas Cocina")
+            self.geometry("900x600")
+
+            self.interval_var = tk.IntVar(value=max(5, args.auto_interval))
+            self.auto_thread = None
+            self.auto_stop = threading.Event()
+            self.printed_orders = []
+
+            self._build_layout()
+            self.refresh_printed_orders()
+
+        # ----- UI construction -----
+        def _build_layout(self):
+            main = ttk.Frame(self, padding=10)
+            main.pack(fill=tk.BOTH, expand=True)
+
+            # Upper controls
+            controls = ttk.Frame(main)
+            controls.pack(fill=tk.X)
+
+            ttk.Label(controls, text="Intervalo automático (segundos):").pack(side=tk.LEFT)
+            interval_spin = ttk.Spinbox(
+                controls,
+                from_=5,
+                to=600,
+                textvariable=self.interval_var,
+                width=5
+            )
+            interval_spin.pack(side=tk.LEFT, padx=(5, 15))
+
+            ttk.Button(controls, text="Imprimir pendientes", command=self.print_pending_orders).pack(side=tk.LEFT)
+            ttk.Button(controls, text="Reimprimir selección", command=self.reprint_selected).pack(side=tk.LEFT, padx=5)
+            ttk.Button(controls, text="Refrescar", command=self.refresh_printed_orders).pack(side=tk.LEFT)
+            self.auto_btn = ttk.Button(controls, text="Iniciar automático", command=self.toggle_auto)
+            self.auto_btn.pack(side=tk.LEFT, padx=(15, 0))
+
+            # Printed orders list
+            list_frame = ttk.Frame(main)
+            list_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+            columns = ("ticket", "mesa", "cliente", "fecha")
+            self.tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=10)
+            self.tree.heading("ticket", text="Ticket")
+            self.tree.heading("mesa", text="Mesa")
+            self.tree.heading("cliente", text="Cliente")
+            self.tree.heading("fecha", text="Última impresión")
+            self.tree.column("ticket", width=140)
+            self.tree.column("mesa", width=120)
+            self.tree.column("cliente", width=180)
+            self.tree.column("fecha", width=160)
+            self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+
+            tree_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
+            self.tree.configure(yscrollcommand=tree_scroll.set)
+
+            self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+            # Details and log
+            bottom = ttk.Panedwindow(main, orient=tk.HORIZONTAL)
+            bottom.pack(fill=tk.BOTH, expand=True)
+
+            detail_frame = ttk.Labelframe(bottom, text="Detalle")
+            self.detail_text = tk.Text(detail_frame, wrap=tk.WORD, height=12, state=tk.DISABLED)
+            self.detail_text.pack(fill=tk.BOTH, expand=True)
+            bottom.add(detail_frame, weight=1)
+
+            log_frame = ttk.Labelframe(bottom, text="Eventos")
+            self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=12, state=tk.DISABLED)
+            self.log_text.pack(fill=tk.BOTH, expand=True)
+            bottom.add(log_frame, weight=1)
+
+            self.status_var = tk.StringVar(value="Listo")
+            ttk.Label(main, textvariable=self.status_var).pack(fill=tk.X)
+
+        # ----- Helpers -----
+        def append_log(self, msg):
+            ts = dt.datetime.now().strftime("%H:%M:%S")
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.insert(tk.END, f"[{ts}] {msg}\n")
+            self.log_text.see(tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+
+        def set_status(self, msg):
+            self.status_var.set(msg)
+
+        def _safe_interval(self):
+            try:
+                return max(5, int(self.interval_var.get()))
+            except (TypeError, ValueError):
+                self.interval_var.set(30)
+                return 30
+
+        def _run_async(self, target):
+            thread = threading.Thread(target=target, daemon=True)
+            thread.start()
+            return thread
+
+        # ----- Data handling -----
+        def refresh_printed_orders(self):
+            def job():
+                try:
+                    data = fetch_recent_printed(pos_categ_id=args.pos_categ, limit_orders=args.max_orders)
+                    self.after(0, lambda: self._load_printed_orders(data))
+                except Exception as exc:
+                    self.after(0, lambda: messagebox.showerror("Error al refrescar", str(exc)))
+                    self.after(0, lambda: self.set_status("Error al refrescar"))
+            self.set_status("Actualizando comandas impresas...")
+            self._run_async(job)
+
+        def _load_printed_orders(self, orders):
+            self.tree.delete(*self.tree.get_children())
+            self.printed_orders = orders
+            for idx, payload in enumerate(orders):
+                order = payload['order']
+                table = (order.get('table_id') or ['', ''])
+                partner = (order.get('partner_id') or ['', ''])
+                mesa = table[1] if len(table) > 1 else ''
+                cliente = partner[1] if len(partner) > 1 else ''
+                fecha = payload.get('last_write_date') or ''
+                self.tree.insert('', tk.END, iid=str(idx), values=(order.get('name'), mesa, cliente, fecha))
+            self.set_status(f"Comandas impresas: {len(orders)}")
+            if orders:
+                self.tree.selection_set('0')
+
+        def on_tree_select(self, event=None):
+            selection = self.tree.selection()
+            if not selection:
+                self.detail_text.configure(state=tk.NORMAL)
+                self.detail_text.delete('1.0', tk.END)
+                self.detail_text.configure(state=tk.DISABLED)
+                return
+            idx = int(selection[0])
+            payload = self.printed_orders[idx]
+            self.detail_text.configure(state=tk.NORMAL)
+            self.detail_text.delete('1.0', tk.END)
+            self.detail_text.insert(tk.END, payload.get('ticket_text', ''))
+            self.detail_text.configure(state=tk.DISABLED)
+
+        def print_pending_orders(self):
+            def job():
+                try:
+                    result = process_pending_orders(
+                        pos_categ_id=args.pos_categ,
+                        max_orders=args.max_orders,
+                        dry_run=args.dry_run,
+                        verbose=False,
+                    )
+                    def update_ui():
+                        printed = result['printed']
+                        errors = result['errors']
+                        if printed:
+                            self.append_log(f"Impresas {len(printed)} comandas nuevas.")
+                            self.refresh_printed_orders()
+                        else:
+                            self.append_log("No había comandas pendientes.")
+                        if errors:
+                            for err in errors:
+                                self.append_log(f"Error al imprimir {err['order'].get('name')}: {err['error']}")
+                            messagebox.showwarning(
+                                "Errores de impresión",
+                                f"Hubo {len(errors)} errores al imprimir. Ver registro para más detalle."
+                            )
+                        self.set_status("Listo")
+                    self.after(0, update_ui)
+                except Exception as exc:
+                    self.after(0, lambda: messagebox.showerror("Error al imprimir", str(exc)))
+                    self.after(0, lambda: self.set_status("Error al imprimir"))
+            self.set_status("Imprimiendo comandas pendientes...")
+            self._run_async(job)
+
+        def reprint_selected(self):
+            selection = self.tree.selection()
+            if not selection:
+                messagebox.showinfo("Reimprimir", "Seleccione una comanda de la lista.")
+                return
+            idx = int(selection[0])
+            payload = self.printed_orders[idx]
+            txt = payload.get('ticket_text')
+            def job():
+                try:
+                    print_raw_selected(txt, verbose=False)
+                    self.after(0, lambda: self.append_log(f"Reimpresa comanda {payload['order'].get('name')}"))
+                except Exception as exc:
+                    self.after(0, lambda: messagebox.showerror("Error al reimprimir", str(exc)))
+            self._run_async(job)
+
+        def toggle_auto(self):
+            if self.auto_thread and self.auto_thread.is_alive():
+                self.auto_stop.set()
+                thread = self.auto_thread
+                thread.join(timeout=2)
+                self.auto_thread = None
+                self.auto_btn.configure(text="Iniciar automático")
+                self.append_log("Auto impresión detenida.")
+                self.set_status("Listo")
+                return
+
+            self.auto_stop.clear()
+
+            def loop():
+                while not self.auto_stop.is_set():
+                    self.after(0, lambda: self.set_status("Ejecución automática"))
+                    try:
+                        result = process_pending_orders(
+                            pos_categ_id=args.pos_categ,
+                            max_orders=args.max_orders,
+                            dry_run=args.dry_run,
+                            verbose=False,
+                        )
+                        printed = result['printed']
+                        errors = result['errors']
+                        if printed:
+                            self.after(0, lambda: self.append_log(f"Automático: impresas {len(printed)} comandas."))
+                            self.after(0, self.refresh_printed_orders)
+                        else:
+                            self.after(0, lambda: self.append_log("Automático: sin comandas pendientes."))
+                        if errors:
+                            self.after(0, lambda: self.append_log(f"Automático: {len(errors)} errores de impresión."))
+                            self.after(0, lambda: messagebox.showwarning(
+                                "Errores de impresión",
+                                "Revise el registro de eventos para ver los errores de impresión."
+                            ))
+                    except Exception as exc:
+                        self.after(0, lambda: self.append_log(f"Error en automático: {exc}"))
+                        self.after(0, lambda: messagebox.showerror("Auto impresión", str(exc)))
+                    wait_seconds = self._safe_interval()
+                    for _ in range(wait_seconds):
+                        if self.auto_stop.wait(1):
+                            break
+                self.after(0, lambda: self.set_status("Listo"))
+
+            self.auto_thread = threading.Thread(target=loop, daemon=True)
+            self.auto_thread.start()
+            self.auto_btn.configure(text="Detener automático")
+            self.append_log("Auto impresión iniciada.")
+
+        def destroy(self):
+            if self.auto_thread and self.auto_thread.is_alive():
+                self.auto_stop.set()
+                self.auto_thread.join(timeout=2)
+            self.auto_thread = None
+            super().destroy()
+
 # =========================
 # Main
 # =========================
@@ -281,32 +653,22 @@ def main():
         print("OK: Página de prueba enviada.")
         return
 
-    batches = fetch_pending_lines(pos_categ_id=args.pos_categ, limit_orders=args.max_orders)
-    if not batches:
-        print("No hay líneas pendientes para imprimir.")
-        return
-
-    for oid, payload in batches.items():
-        order = payload['order']
-        lines = payload['lines']
-        txt = build_ticket(order, lines)
-
-        print(f"\n=== Pedido {order.get('name')} (ID {oid}) ===")
-        print(txt)
-
-        if args.dry_run:
-            print("DRY-RUN: no se imprime ni se marca.")
-            continue
-
-        try:
-            print_raw_selected(txt, verbose=True)
-            mark_printed([l['id'] for l in lines])
-            print("OK: Impreso y marcado.")
-        except Exception as e:
-            print(f"ERROR al imprimir: {e}")
+    try:
+        process_pending_orders(
+            pos_categ_id=args.pos_categ,
+            max_orders=args.max_orders,
+            dry_run=args.dry_run,
+            verbose=True,
+        )
+    except Exception as e:
+        print(f"ERROR al imprimir: {e}")
 
 if __name__ == "__main__":
     try:
-        main()
+        if args.gui:
+            app = KitchenPrinterGUI()
+            app.mainloop()
+        else:
+            main()
     except KeyboardInterrupt:
         print("\nCancelado por el usuario.")
