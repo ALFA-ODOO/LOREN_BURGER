@@ -554,7 +554,10 @@ if args.gui:
                 self.detail_text.delete('1.0', tk.END)
                 self.detail_text.configure(state=tk.DISABLED)
                 return
-            idx = int(selection[0])
+            try:
+                idx = int(selection[0])
+            except (TypeError, ValueError):
+                return
             payload = self.printed_orders[idx]
             self.detail_text.configure(state=tk.NORMAL)
             self.detail_text.delete('1.0', tk.END)
@@ -598,7 +601,11 @@ if args.gui:
             if not selection:
                 messagebox.showinfo("Reimprimir", "Seleccione una comanda de la lista.")
                 return
-            idx = int(selection[0])
+            try:
+                idx = int(selection[0])
+            except (TypeError, ValueError):
+                messagebox.showinfo("Reimprimir", "Seleccione una comanda de la lista.")
+                return
             payload = self.printed_orders[idx]
             if not payload.get('printed'):
                 messagebox.showinfo("Reimprimir", "Solo se pueden reimprimir comandas ya impresas.")
